@@ -6,18 +6,22 @@ export default defineConfig({
   model: {},
   initialState: {},
   request: {},
-  layout: {
-    title: 'Image Agent Demo',
-  },
   routes: [
     {
       path: '/',
       redirect: '/home',
     },
     {
-      name: '图片 Agent',
       path: '/home',
       component: './Home',
+    },
+    {
+      path: '/tasks',
+      component: './Tasks',
+    },
+    {
+      path: '/styles',
+      component: './Styles',
     },
   ],
   proxy: {

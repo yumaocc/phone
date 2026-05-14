@@ -5,6 +5,8 @@ import {
   Query,
   UploadedFile,
   UseInterceptors,
+  Request,
+  Body,
 } from '@nestjs/common';
 import { GenerateAgentService } from './generate-agent.service';
 import { FileInterceptor } from '@nestjs/platform-express';
@@ -25,7 +27,11 @@ export class GenerateAgentController {
     file:
       | { originalname: string; mimetype: string; buffer: Buffer }
       | undefined,
+    @Body('note') note?: string,
+    @Body('isPublic') isPublic: boolean = false,
+    @Request() req?,
   ) {
-    return this.generateAgentService.upload(file);
+    const userId = req?.userId ?? req?.user?.id;
+    return this.generateAgentService.upload(file, userId, note, isPublic);
   }
 }

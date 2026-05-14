@@ -3,9 +3,10 @@ import { LlmService } from './llm.service';
 import { LlmController } from './llm.controller';
 import { GenerateAgentModule } from '../generate-agent/generate-agent.module';
 import { StyleRagModule } from '../style-rag/style-rag.module';
+import { UserModule } from '../user/user.module';
 
 @Module({
-  imports: [GenerateAgentModule, StyleRagModule],
+  imports: [GenerateAgentModule, StyleRagModule, UserModule],
   controllers: [LlmController],
   providers: [LlmService],
   exports: [LlmService],

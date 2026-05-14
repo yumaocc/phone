@@ -115,6 +115,9 @@ export class GenerateAgentService {
     file:
       | { originalname: string; mimetype: string; buffer: Buffer }
       | undefined,
+    userId?: string,
+    note?: string,
+    isPublic: boolean = false,
   ): Promise<string> {
     const baseUrl = this.configService.get<string>('GEMINI_BASE_URL');
     const apiKey = this.configService.get<string>('GEMINI_API_KEY');
@@ -134,6 +137,15 @@ export class GenerateAgentService {
     fileBytes.set(file.buffer);
     const blob = new Blob([fileBytes.buffer], { type: file.mimetype });
     formData.append('file', blob, file.originalname);
+
+    // 添加用户信息到表单数据
+    if (userId) {
+      formData.append('userId', userId);
+    }
+    if (note) {
+      formData.append('note', note);
+    }
+    formData.append('isPublic', String(isPublic));
 
     const res = await fetch(`${baseUrl.replace(/\/$/, '')}/uploads/images`, {
       method: 'POST',

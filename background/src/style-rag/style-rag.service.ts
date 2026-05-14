@@ -2,42 +2,109 @@ import {
   BadRequestException,
   Injectable,
   InternalServerErrorException,
+  Logger,
+  OnModuleInit,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ChatOpenAI, OpenAIEmbeddings } from '@langchain/openai';
+import { QdrantClient } from '@qdrant/js-client-rest';
 import {
   StyleReferenceAnalysisDto,
   type StyleReferenceEntry,
-  StyleReferenceEntryDto,
   type StyleReferenceSearchResult,
   StyleReferenceSearchResultDto,
   type StyleReferenceSummary,
   StyleReferenceSummaryDto,
 } from './style-rag.dto';
+import { STYLE_RAG_PROMPTS } from '../prompts/prompts';
 
 @Injectable()
-export class StyleRagService {
-  private readonly storageDir = path.join(
+export class StyleRagService implements OnModuleInit {
+  private readonly collectionName = 'style_references';
+  private readonly logger = new Logger(StyleRagService.name);
+  private readonly uploadDir = path.join(
     process.cwd(),
     'local-data',
     'style-rag',
+    'uploads',
   );
-  private readonly uploadDir = path.join(this.storageDir, 'uploads');
-  private readonly indexFile = path.join(this.storageDir, 'styles.json');
-  private entriesCache: StyleReferenceEntry[] | null = null;
+  private embeddings: OpenAIEmbeddings | null = null;
+  private entriesCache: Map<string, StyleReferenceEntry> = new Map();
+  private qdrantAvailable = false;
 
-  constructor(private configService: ConfigService) {}
+  constructor(
+    private configService: ConfigService,
+    private qdrantClient: QdrantClient,
+  ) {}
 
-  // 接收一张风格参考图，完成分析、向量化并写入本地索引。
+  async onModuleInit(): Promise<void> {
+    await this.initializeCollection();
+  }
+
+  private async initializeCollection(): Promise<void> {
+    try {
+      await this.qdrantClient.getCollection(this.collectionName);
+      this.qdrantAvailable = true;
+    } catch {
+      try {
+        // Qwen embedding model uses 1024 dimensions
+        const embeddingDim = 1024;
+        await this.qdrantClient.createCollection(this.collectionName, {
+          vectors: {
+            size: embeddingDim,
+            distance: 'Cosine',
+          },
+        });
+        this.qdrantAvailable = true;
+      } catch (error) {
+        this.qdrantAvailable = false;
+        this.logger.warn(
+          `Qdrant unavailable, style RAG disabled during this run: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+  }
+
+  private getEmbeddings(): OpenAIEmbeddings {
+    if (!this.embeddings) {
+      const modelName = this.getEmbeddingModelName();
+      if (!modelName) {
+        throw new BadRequestException(
+          '未配置嵌入模型，请设置 QWEN_EMBEDDING_MODEL 或 EMBEDDING_MODEL',
+        );
+      }
+
+      this.embeddings = new OpenAIEmbeddings({
+        apiKey: this.configService.get<string>('QWEN_API_KEY')!,
+        model: modelName,
+        configuration: {
+          baseURL: this.configService.get<string>('QWEN_BASE_URL'),
+        },
+      });
+    }
+
+    return this.embeddings;
+  }
+
   async uploadStyleReference(
     file:
       | { originalname: string; mimetype: string; buffer: Buffer }
       | undefined,
+    userId: string,
     note?: string,
+    isPublic: boolean = false,
   ): Promise<StyleReferenceSummary> {
+    if (!this.qdrantAvailable) {
+      throw new InternalServerErrorException(
+        'Qdrant 不可用，暂时无法上传风格参考图',
+      );
+    }
+
     if (!file) {
       throw new BadRequestException('请先上传图片文件');
     }
@@ -46,7 +113,13 @@ export class StyleRagService {
       throw new BadRequestException('仅支持图片文件');
     }
 
-    await this.ensureStorage();
+    // 限制文件大小为 10MB，防止内存溢出
+    const maxFileSize = 10 * 1024 * 1024;
+    if (file.buffer.length > maxFileSize) {
+      throw new BadRequestException('文件大小不能超过 10MB');
+    }
+
+    await this.ensureUploadDir();
 
     const extension =
       path.extname(file.originalname) || this.getExtension(file.mimetype);
@@ -58,7 +131,6 @@ export class StyleRagService {
     const analysis = await this.analyzeImage(file.buffer, file.mimetype, note);
     const content = this.buildRetrievableContent(analysis, note);
     const embedding = await this.embedText(content);
-    const entries = await this.loadEntries();
 
     const entry: StyleReferenceEntry = {
       id: randomUUID(),
@@ -73,58 +145,102 @@ export class StyleRagService {
       embedding,
     };
 
-    entries.unshift(entry);
-    await this.saveEntries(entries);
+    // Store in Qdrant，包含用户 ID 和公开状态
+    await this.qdrantClient.upsert(this.collectionName, {
+      points: [
+        {
+          id: this.stringToId(entry.id),
+          vector: embedding,
+          payload: {
+            id: entry.id,
+            userId,
+            isPublic,
+            originalName: entry.originalName,
+            storedName: entry.storedName,
+            mimeType: entry.mimeType,
+            localPath: entry.localPath,
+            note: entry.note,
+            createdAt: entry.createdAt,
+            analysis: JSON.stringify(entry.analysis),
+            content: entry.content,
+          },
+        },
+      ],
+    });
+
+    // 更新缓存，确保新上传的参考图立即可用
+    this.entriesCache.set(entry.id, entry);
 
     return this.toSummary(entry);
   }
 
-  // 返回当前已经入库的风格参考图摘要列表。
-  async listStyleReferences(): Promise<StyleReferenceSummary[]> {
-    const entries = await this.loadEntries();
-
-    return entries.map((entry) => this.toSummary(entry));
+  async listStyleReferences(userId: string): Promise<StyleReferenceSummary[]> {
+    const entries = await this.getAllEntries();
+    // 只返回该用户的参考或公开的参考
+    const filtered = entries.filter(
+      (entry) =>
+        (entry as any).userId === userId || (entry as any).isPublic === true,
+    );
+    return filtered.map((entry) => this.toSummary(entry));
   }
 
-  // 对用户查询做向量检索，返回最相关的风格参考结果。
   async searchStyleReferences(
     query: string,
+    userId?: string,
     limit = 3,
   ): Promise<StyleReferenceSearchResult[]> {
     const trimmedQuery = query.trim();
 
-    if (!trimmedQuery) {
-      return [];
-    }
-
-    const embeddingModelName = this.getEmbeddingModelName();
-
-    if (!embeddingModelName) {
-      return [];
-    }
-
-    const entries = await this.loadEntries();
-
-    if (!entries.length) {
+    if (
+      !trimmedQuery ||
+      !this.getEmbeddingModelName() ||
+      !this.qdrantAvailable
+    ) {
       return [];
     }
 
     const queryEmbedding = await this.embedText(trimmedQuery);
 
-    return entries
-      .map((entry) => ({
-        ...this.toSummary(entry),
-        score: this.cosineSimilarity(queryEmbedding, entry.embedding),
-      }))
-      .sort((left, right) => right.score - left.score)
-      .slice(0, limit)
-      .filter((entry) => entry.score > 0)
-      .map((entry) => StyleReferenceSearchResultDto.parse(entry));
+    // 设置相关度阈值为 0.5，确保只返回相关度较高的参考
+    // 对于漫画参考，相关度太低的结果会误导生成
+    const results = await this.qdrantClient.search(this.collectionName, {
+      vector: queryEmbedding,
+      limit,
+      score_threshold: 0.5,
+      // 如果提供了 userId，则过滤该用户的参考或公开参考
+      filter: userId
+        ? {
+            must: [
+              {
+                should: [
+                  { key: 'userId', match: { value: userId } },
+                  { key: 'isPublic', match: { value: true } },
+                ],
+              },
+            ],
+          }
+        : undefined,
+    });
+
+    return results.map((result) => {
+      const payload = result.payload as Record<string, unknown>;
+      const analysis = JSON.parse(payload.analysis as string);
+
+      return StyleReferenceSearchResultDto.parse({
+        id: payload.id,
+        originalName: payload.originalName,
+        storedName: payload.storedName,
+        mimeType: payload.mimeType,
+        note: payload.note,
+        createdAt: payload.createdAt,
+        analysis,
+        score: result.score,
+      });
+    });
   }
 
-  // 将检索结果整理成可注入给模型的风格上下文文本。
-  async buildStyleContext(query: string, limit = 3): Promise<string> {
-    const references = await this.searchStyleReferences(query, limit);
+  async buildStyleContext(query: string, userId?: string, limit = 3): Promise<string> {
+    const references = await this.searchStyleReferences(query, userId, limit);
 
     if (!references.length) {
       return '';
@@ -133,15 +249,31 @@ export class StyleRagService {
     return references
       .map((reference, index) => {
         const blocks = [
-          `风格参考 ${index + 1}（相关度 ${reference.score.toFixed(3)}）`,
+          `漫画参考 ${index + 1}（相关度 ${(reference.score * 100).toFixed(1)}%）`,
           `标题：${reference.analysis.title}`,
           `摘要：${reference.analysis.summary}`,
-          `风格标签：${reference.analysis.styleTags.join('、') || '无'}`,
-          `配色：${reference.analysis.colorTags.join('、') || '无'}`,
-          `构图：${reference.analysis.compositionTags.join('、') || '无'}`,
-          `氛围：${reference.analysis.moodTags.join('、') || '无'}`,
-          `避免：${reference.analysis.negativeTags.join('、') || '无'}`,
         ];
+
+        // 只在有内容时才添加标签，避免"无"的重复
+        if (reference.analysis.styleTags.length > 0) {
+          blocks.push(`美术风格：${reference.analysis.styleTags.join('、')}`);
+        }
+
+        if (reference.analysis.colorTags.length > 0) {
+          blocks.push(`色彩基调：${reference.analysis.colorTags.join('、')}`);
+        }
+
+        if (reference.analysis.compositionTags.length > 0) {
+          blocks.push(`分镜构图：${reference.analysis.compositionTags.join('、')}`);
+        }
+
+        if (reference.analysis.moodTags.length > 0) {
+          blocks.push(`故事氛围：${reference.analysis.moodTags.join('、')}`);
+        }
+
+        if (reference.analysis.negativeTags.length > 0) {
+          blocks.push(`应避免：${reference.analysis.negativeTags.join('、')}`);
+        }
 
         if (reference.note) {
           blocks.push(`用户备注：${reference.note}`);
@@ -152,7 +284,6 @@ export class StyleRagService {
       .join('\n\n');
   }
 
-  // 调用视觉模型分析图片，并约束返回结构化 JSON。
   private async analyzeImage(buffer: Buffer, mimeType: string, note?: string) {
     const model = new ChatOpenAI({
       apiKey: this.configService.get<string>('QWEN_API_KEY')!,
@@ -168,18 +299,14 @@ export class StyleRagService {
     const response = await model.invoke([
       {
         role: 'system',
-        content:
-          '你是一个图片风格分析助手。请分析用户提供的风格参考图，并严格返回 JSON，不要输出任何额外说明。JSON 字段必须包含：title、summary、styleTags、colorTags、compositionTags、moodTags、negativeTags、retrievableText。',
+        content: STYLE_RAG_PROMPTS.systemPrompt,
       },
       {
         role: 'user',
         content: [
           {
             type: 'text',
-            text:
-              `请从风格、配色、构图、光线、材质、氛围、适合延续的审美方向、应避免的问题等角度分析这张图片。` +
-              `如果用户有备注，也要一起纳入分析。用户备注：${note?.trim() || '无'}` +
-              '请确保 retrievableText 是适合做向量检索的中文自然语言总结。',
+            text: STYLE_RAG_PROMPTS.userPromptTemplate(note),
           },
           {
             type: 'image_url',
@@ -194,28 +321,10 @@ export class StyleRagService {
     return StyleReferenceAnalysisDto.parse(this.parseJson(response.text));
   }
 
-  // 将文本转换成向量，供后续相似度检索使用。
   private async embedText(text: string): Promise<number[]> {
-    const modelName = this.getEmbeddingModelName();
-
-    if (!modelName) {
-      throw new BadRequestException(
-        '未配置嵌入模型，请设置 QWEN_EMBEDDING_MODEL 或 EMBEDDING_MODEL',
-      );
-    }
-
-    const embeddings = new OpenAIEmbeddings({
-      apiKey: this.configService.get<string>('QWEN_API_KEY')!,
-      model: modelName,
-      configuration: {
-        baseURL: this.configService.get<string>('QWEN_BASE_URL'),
-      },
-    });
-
-    return embeddings.embedQuery(text);
+    return this.getEmbeddings().embedQuery(text);
   }
 
-  // 统一读取当前可用的嵌入模型名称。
   private getEmbeddingModelName(): string | undefined {
     return (
       this.configService.get<string>('QWEN_EMBEDDING_MODEL') ??
@@ -223,7 +332,6 @@ export class StyleRagService {
     );
   }
 
-  // 把分析结果和用户备注拼成更适合向量检索的文本。
   private buildRetrievableContent(
     analysis: StyleReferenceEntry['analysis'],
     note?: string,
@@ -246,45 +354,48 @@ export class StyleRagService {
     return sections.join('\n');
   }
 
-  // 确保本地目录和索引文件已经创建。
-  private async ensureStorage(): Promise<void> {
+  private async ensureUploadDir(): Promise<void> {
     await fs.mkdir(this.uploadDir, { recursive: true });
-
-    try {
-      await fs.access(this.indexFile);
-    } catch {
-      await fs.writeFile(this.indexFile, '[]', 'utf8');
-    }
   }
 
-  // 从本地 JSON 读取风格索引，并在内存中缓存结果。
-  private async loadEntries(): Promise<StyleReferenceEntry[]> {
-    if (this.entriesCache) {
-      return this.entriesCache;
+  private async getAllEntries(): Promise<StyleReferenceEntry[]> {
+    if (!this.qdrantAvailable) {
+      return [];
     }
 
-    await this.ensureStorage();
+    // 如果缓存已有数据，直接返回
+    if (this.entriesCache.size > 0) {
+      return Array.from(this.entriesCache.values());
+    }
 
-    const raw = await fs.readFile(this.indexFile, 'utf8');
-    const parsed = JSON.parse(raw) as unknown;
-    const entries = StyleReferenceEntryDto.array().parse(parsed);
+    // 从 Qdrant 加载所有条目
+    const results = await this.qdrantClient.scroll(this.collectionName, {
+      limit: 1000,
+      with_vector: true,
+    });
 
-    this.entriesCache = entries;
+    const entries: StyleReferenceEntry[] = results.points.map((point) => {
+      const payload = point.payload as Record<string, unknown>;
+      const vector = Array.isArray(point.vector) ? point.vector : [];
+      return {
+        id: payload.id as string,
+        originalName: payload.originalName as string,
+        storedName: payload.storedName as string,
+        mimeType: payload.mimeType as string,
+        localPath: payload.localPath as string,
+        note: (payload.note as string) || undefined,
+        createdAt: payload.createdAt as string,
+        analysis: JSON.parse(payload.analysis as string),
+        content: payload.content as string,
+        embedding: vector as number[],
+      };
+    });
+
+    // 填充缓存，后续新上传的参考图会通过 uploadStyleReference 更新缓存
+    entries.forEach((entry) => this.entriesCache.set(entry.id, entry));
     return entries;
   }
 
-  // 将最新索引写回本地文件，同时刷新内存缓存。
-  private async saveEntries(entries: StyleReferenceEntry[]): Promise<void> {
-    this.entriesCache = entries;
-
-    await fs.writeFile(
-      this.indexFile,
-      JSON.stringify(entries, null, 2),
-      'utf8',
-    );
-  }
-
-  // 把完整索引项转换成前端展示用的摘要结构。
   private toSummary(entry: StyleReferenceEntry): StyleReferenceSummary {
     return StyleReferenceSummaryDto.parse({
       id: entry.id,
@@ -297,7 +408,6 @@ export class StyleRagService {
     });
   }
 
-  // 根据 MIME 类型推导本地落盘时的文件扩展名。
   private getExtension(mimeType: string): string {
     if (mimeType === 'image/png') {
       return '.png';
@@ -314,7 +424,6 @@ export class StyleRagService {
     return '.jpg';
   }
 
-  // 兼容模型返回的代码块文本，并解析出 JSON 对象。
   private parseJson(text: string): unknown {
     const trimmed = text.trim();
     const fenced = trimmed.match(/```json\s*([\s\S]*?)\s*```/i);
@@ -331,26 +440,13 @@ export class StyleRagService {
     }
   }
 
-  // 计算两个向量的余弦相似度，用于检索排序。
-  private cosineSimilarity(left: number[], right: number[]): number {
-    if (!left.length || !right.length || left.length !== right.length) {
-      return 0;
+  private stringToId(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+      const char = str.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash; // Convert to 32bit integer
     }
-
-    let dot = 0;
-    let leftNorm = 0;
-    let rightNorm = 0;
-
-    for (let index = 0; index < left.length; index += 1) {
-      dot += left[index] * right[index];
-      leftNorm += left[index] * left[index];
-      rightNorm += right[index] * right[index];
-    }
-
-    if (!leftNorm || !rightNorm) {
-      return 0;
-    }
-
-    return dot / (Math.sqrt(leftNorm) * Math.sqrt(rightNorm));
+    return Math.abs(hash);
   }
 }

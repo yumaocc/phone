@@ -1,0 +1,75 @@
+.chat-bubble {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 85%;
+  padding: 12px 14px;
+  border-radius: 16px;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+
+  &.chat-bubble-user {
+    align-self: flex-end;
+    background: linear-gradient(135deg, #eef6e8 0%, #e1efda 100%);
+    color: #20443c;
+    box-shadow: 0 8px 16px rgba(142, 182, 155, 0.12);
+  }
+
+  &.chat-bubble-assistant {
+    align-self: flex-start;
+    border: 1px solid rgba(200, 223, 206, 0.2);
+    background: linear-gradient(180deg, #fffefb 0%, #fbfff8 100%);
+    color: #28463f;
+  }
+}
+
+.chat-role {
+  margin-bottom: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.72;
+}
+
+.chat-content {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  line-height: 1.5;
+}
+
+.chat-task-id {
+  margin-top: 8px;
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chat-loading {
+  margin-top: 8px;
+  width: 100%;
+}
+
+.chat-images {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+  width: 100%;
+
+  :global(.ant-image) {
+    width: 100%;
+    height: 100px;
+    border-radius: 8px;
+    overflow: hidden;
+
+    :global(.ant-image-img) {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+  }
+}

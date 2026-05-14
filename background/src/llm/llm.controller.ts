@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post } from '@nestjs/common';
+import { Body, Controller, Get, Post, Request } from '@nestjs/common';
 import { ChatResponseDto } from './dto/chat-response.dto';
 import { LlmService } from './llm.service';
 
@@ -8,6 +8,7 @@ export class LlmController {
 
   @Post('/msg')
   message(
+    @Request() req: any,
     @Body()
     body: {
       message?: string;
@@ -22,15 +23,18 @@ export class LlmController {
       };
     },
   ): Promise<ChatResponseDto> {
+    const userId = req?.userId;
     return this.llmService.message(
       body.message ?? '',
       body.conversationId,
+      userId,
       body.imageUrls,
       body.size,
       body.n,
       body.metadata,
     );
   }
+
   @Get('/')
   get() {
     return '';

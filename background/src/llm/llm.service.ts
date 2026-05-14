@@ -12,6 +12,10 @@ import {
 } from '../generate-agent/generate-image.dto';
 import { StyleRagService } from '../style-rag/style-rag.service';
 import { type ChatResponseDto } from './dto/chat-response.dto';
+import {
+  LLM_PROMPTS,
+  GENERATE_IMAGE_TOOL_DESCRIPTION,
+} from '../prompts/prompts';
 
 type GenerateImageMetadata = {
   resolution?: string;
@@ -68,8 +72,7 @@ export class LlmService {
           },
           {
             name: 'generate_image',
-            description:
-              '根据已经补全的信息创建图片生成任务。必须提供经过优化后的完整 prompt，不要直接照抄用户原句；如果用户要求参考已有图片，可以通过 image_urls 传入图片 URL。该工具只返回 taskId，前端会基于 taskId 查询最终图片结果。',
+            description: GENERATE_IMAGE_TOOL_DESCRIPTION,
             schema: GenerateImageDto,
           },
         ),
@@ -82,13 +85,17 @@ export class LlmService {
   async message(
     msg: string,
     conversationId?: string,
+    userId?: string,
     imageUrls: string[] = [],
     size?: string,
     n?: number,
     metadata?: GenerateImageMetadata,
   ): Promise<ChatResponseDto> {
     const currentConversationId = conversationId ?? randomUUID();
-    const styleContext = await this.styleRagService.buildStyleContext(msg);
+    // 为每个用户创建独立的会话 ID，格式：userId:conversationId
+    const threadId = userId ? `${userId}:${currentConversationId}` : currentConversationId;
+
+    const styleContext = await this.styleRagService.buildStyleContext(msg, userId);
     const agent = this.create(
       this.buildSystemPrompt(styleContext, imageUrls.length, size, n, metadata),
       imageUrls,
@@ -104,7 +111,7 @@ export class LlmService {
       },
       {
         configurable: {
-          thread_id: currentConversationId,
+          thread_id: threadId,
         },
       },
     );
@@ -165,36 +172,39 @@ export class LlmService {
     metadata?: GenerateImageMetadata,
   ): string {
     return [
-      '你的回答必须使用中文。你是一个资深的 AI 绘画提示词专家，同时也是图片生成助手。',
-      '你的核心职责不是照抄用户原话，而是先理解用户意图，再把用户输入优化成适合生图模型直接使用的高质量提示词。',
-      '优化提示词时，你要优先整合这些维度：主体、场景、动作、构图、镜头或视角、风格、光线、色彩、氛围、材质细节、画面质量、需要避免的问题，如果缺少关键信息，应该即使向用户提问，补充关键词，然后再去做提示词的生成。',
-      '如果用户是在已有对话基础上追加修改，你必须保留已经确认的关键信息，只修改用户这次明确要求调整的部分。',
+      LLM_PROMPTS.identity,
+      LLM_PROMPTS.responsibility,
+      LLM_PROMPTS.optimizationDimensions,
+      LLM_PROMPTS.conversationContinuity,
       referenceImageCount
-        ? `当前这轮请求在底层已经附带了 ${referenceImageCount} 张参考图。你不需要再向用户索取图片，也不要说“没有收到参考图”。如果用户本轮意图依赖参考图，请直接基于这些参考图来组织提示词；系统会在调用 generate_image 时自动把参考图传入 image_urls。`
-        : '当前这轮请求没有附带参考图。',
+        ? LLM_PROMPTS.referenceImageWithImages(referenceImageCount)
+        : LLM_PROMPTS.referenceImageWithoutImages,
       size
-        ? `当前这轮请求在界面上已经指定图片比例为 ${size}。你不需要再追问比例，也不要自行修改这个参数；系统会在调用 generate_image 时自动传入。`
-        : '当前这轮请求没有在界面上指定图片比例，如果用户也没有明确说明，你可以根据画面用途自行判断合适比例。',
+        ? LLM_PROMPTS.sizeSpecified(size)
+        : LLM_PROMPTS.sizeNotSpecified,
       typeof n === 'number'
-        ? `当前这轮请求在界面上已经指定生成数量为 ${n} 张。你不需要再追问张数，也不要自行修改这个参数；系统会在调用 generate_image 时自动传入。`
-        : '当前这轮请求没有在界面上指定生成数量。',
+        ? LLM_PROMPTS.quantitySpecified(n)
+        : LLM_PROMPTS.quantityNotSpecified,
       metadata?.resolution
-        ? `当前这轮请求在界面上已经指定输出分辨率为 ${metadata.resolution}。你不需要再追问分辨率，也不要自行修改这个参数；系统会在调用 generate_image 时自动传入 metadata.resolution。`
-        : '当前这轮请求没有在界面上指定输出分辨率。',
+        ? LLM_PROMPTS.resolutionSpecified(metadata.resolution)
+        : LLM_PROMPTS.resolutionNotSpecified,
       metadata?.google_search
-        ? '当前这轮请求已开启 Google 文字搜索增强。系统会在调用 generate_image 时自动传入 metadata.google_search=true。'
-        : '当前这轮请求未开启 Google 文字搜索增强。',
+        ? LLM_PROMPTS.googleSearchEnabled
+        : LLM_PROMPTS.googleSearchDisabled,
       metadata?.google_image_search
-        ? '当前这轮请求已开启 Google 图片搜索增强。系统会在调用 generate_image 时自动传入 metadata.google_image_search=true。'
-        : '当前这轮请求未开启 Google 图片搜索增强。',
-      '如果关键信息缺失，并且会明显影响生成结果，例如主体不明确、场景冲突、风格方向差异很大、比例用途会显著影响构图，你必须先追问 1 到 2 个最关键的问题，暂时不要调用 generate_image。',
-      '如果只是次要信息缺失，例如镜头轻微细节、局部材质、少量装饰元素，你可以自行补全合理默认值，并直接继续生成。',
-      '当信息足够时，你必须调用 generate_image。传入工具的 prompt 必须是你优化后的完整提示词，而不是用户原始输入。',
-      '只有在界面没有指定比例时，你才需要根据画面方向顺便给出合理的 size。例如人物海报或手机壁纸更适合 9:16，通用头像或社媒封面可用 1:1，横向场景更适合 16:9。',
-      '调用工具成功后，你对用户的回复要简洁，只需要说明你已经优化提示词并创建了图片任务，不要把冗长的完整提示词原样全部贴给用户，除非用户明确要求查看。',
+        ? LLM_PROMPTS.googleImageSearchEnabled
+        : LLM_PROMPTS.googleImageSearchDisabled,
+      LLM_PROMPTS.missingCriticalInfo,
+      LLM_PROMPTS.missingSecondaryInfo,
+      LLM_PROMPTS.toolCallInstruction,
+      LLM_PROMPTS.sizeRecommendation,
+      LLM_PROMPTS.responseStyle,
+      LLM_PROMPTS.characterConsistency,
+      LLM_PROMPTS.storyCoherence,
+      LLM_PROMPTS.chineseAesthetic,
       styleContext
-        ? `以下是你当前检索到的长期风格记忆，请优先参考这些风格特征来完善提示词，但不要把这些检索文本原样复述给用户：\n\n${styleContext}`
-        : '当前还没有检索到可用的长期风格记忆。',
+        ? LLM_PROMPTS.styleContextWithResults(styleContext)
+        : LLM_PROMPTS.styleContextWithoutResults,
     ].join('\n\n');
   }
 }
